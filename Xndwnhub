@@ -1,0 +1,1110 @@
+--[[
+    XANDOWN HUB - PREHISTORIC ISLAND
+    HIT SPEED: 20 a 200 hits por segundo
+    TWEEN SPEED: 0.1 a 1 segundo
+    BOAT SPEED: 50 a 300
+    SEARCH SPEED: 0.5 a 5 segundos
+--]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Player = Players.LocalPlayer
+
+-- ============================================
+-- CONFIGURAÇÕES (AJUSTÁVEIS PELA GUI)
+-- ============================================
+
+local Settings = {
+    -- Velocidades (min e max)
+    HitSpeed = 50,           -- 20 a 200 hits/segundo
+    TweenSpeed = 0.3,        -- 0.1 a 1 segundo
+    BoatSpeed = 120,         -- 50 a 300
+    SearchSpeed = 2,         -- 0.5 a 5 segundos
+    
+    -- Status
+    Ativo = false,
+    Modo = "PROCURAR",       -- PROCURAR, RACHADURAS, COMBATE
+    
+    -- Barco
+    BarcoSelecionado = "Milagre",
+    
+    -- Posições
+    SafeZone = nil,
+}
+
+-- ============================================
+-- UTILITÁRIOS
+-- ============================================
+
+local function GetRoot()
+    local char = Player.Character
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart")
+end
+
+local function Teleportar(posicao)
+    local root = GetRoot()
+    if root then
+        root.CFrame = CFrame.new(posicao)
+    end
+end
+
+local function MoverSuave(posicao)
+    local root = GetRoot()
+    if not root then return end
+    local tween = TweenService:Create(root, TweenInfo.new(Settings.TweenSpeed, Enum.EasingStyle.Linear), {
+        CFrame = CFrame.new(posicao)
+    })
+    tween:Play()
+    return tween
+end
+
+-- ============================================
+-- DETECÇÃO DA ILHA
+-- ============================================
+
+local function EncontrarIlha()
+    local island = Workspace:FindFirstChild("PrehistoricIsland")
+    if island then
+        local relic = island:FindFirstChild("Relic") or island:FindFirstChild("Fossil")
+        if relic then
+            Settings.SafeZone = relic.Position + Vector3.new(0, -10, 25)
+            return island, relic.Position
+        end
+        local pos = island.PrimaryPart and island.PrimaryPart.Position
+        if pos then
+            Settings.SafeZone = pos + Vector3.new(0, -10, 25)
+            return island, pos
+        end
+    end
+    return nil, nil
+end
+
+-- ============================================
+-- DETECÇÃO DE RACHADURAS
+-- ============================================
+
+local function EncontrarRachaduras()
+    local rachaduras = {}
+    local myRoot = GetRoot()
+    
+    for _, obj in pairs(Workspace:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            local nome = obj.Name:lower()
+            if nome:find("crack") or nome:find("rachadura") or nome:find("hotspot") or nome:find("pressure") then
+                table.insert(rachaduras, {
+                    Part = obj,
+                    Position = obj.Position,
+                    Distance = myRoot and (myRoot.Position - obj.Position).Magnitude or math.huge
+                })
+            end
+        end
+    end
+    
+    table.sort(rachaduras, function(a,b) return a.Distance < b.Distance end)
+    return rachaduras
+end
+
+-- ============================================
+-- DETECÇÃO DE GOLEMS
+-- ============================================
+
+local function EncontrarGolems()
+    local golems = {}
+    local myRoot = GetRoot()
+    
+    for _, obj in pairs(Workspace:GetDescendants()) do
+        if obj:IsA("Model") and obj:FindFirstChild("Humanoid") then
+            local nome = obj.Name:lower()
+            if (nome:find("lava") and nome:find("golem")) or nome:find("magma") then
+                local humanoid = obj.Humanoid
+                if humanoid and humanoid.Health > 0 then
+                    local root = obj:FindFirstChild("HumanoidRootPart")
+                    if root then
+                        table.insert(golems, {
+                            Model = obj,
+                            Root = root,
+                            Humanoid = humanoid,
+                            Distance = myRoot and (myRoot.Position - root.Position).Magnitude or math.huge
+                        })
+                    end
+                end
+            end
+        end
+    end
+    
+    table.sort(golems, function(a,b) return a.Distance < b.Distance end)
+    return golems
+end
+
+-- ============================================
+-- ATAQUE AUTOMÁTICO (PASSIVO COM HIT SPEED)
+-- ============================================
+
+local AtaqueAtivo = false
+local LoopAtaque = nil
+local UltimoTempoAtaque = 0
+
+local function Atacar()
+    -- Verifica se está segurando uma ferramenta
+    local char = Player.Character
+    if not char then return end
+    
+    local temFerramenta = false
+    for _, tool in pairs(char:GetChildren()) do
+        if tool:IsA("Tool") then
+            temFerramenta = true
+            break
+        end
+    end
+    
+    if not temFerramenta then return end
+    
+    -- Executa o clique
+    VirtualInputManager:SendMouseButtonEvent(Enum.UserInputType.MouseButton1, 0, 0, true)
+    task.wait(0.02)
+    VirtualInputManager:SendMouseButtonEvent(Enum.UserInputType.MouseButton1, 0, 0, false)
+end
+
+local function IniciarAtaquePassivo()
+    if AtaqueAtivo then return end
+    AtaqueAtivo = true
+    
+    local hitDelay = 1 / math.clamp(Settings.HitSpeed, 20, 200)
+    
+    LoopAtaque = RunService.Heartbeat:Connect(function()
+        if not Settings.Ativo then return end
+        
+        local agora = tick()
+        if agora - UltimoTempoAtaque >= hitDelay then
+            UltimoTempoAtaque = agora
+            Atacar()
+        end
+    end)
+end
+
+local function PararAtaquePassivo()
+    AtaqueAtivo = false
+    if LoopAtaque then
+        LoopAtaque:Disconnect()
+        LoopAtaque = nil
+    end
+end
+
+-- ============================================
+-- USAR SKILLS (APENAS RACHADURAS)
+-- ============================================
+
+local function UsarSkill(tecla)
+    VirtualInputManager:SendKeyEvent(true, tecla, false, game)
+    task.wait(0.05)
+    VirtualInputManager:SendKeyEvent(false, tecla, false, game)
+end
+
+local function ExecutarComboSkills()
+    local skills = {"V", "X", "C", "Z", "F"}
+    for _, skill in pairs(skills) do
+        UsarSkill(skill)
+        task.wait(0.08)
+    end
+end
+
+-- ============================================
+-- FECHAR RACHADURAS (PRIORIDADE MÁXIMA)
+-- ============================================
+
+local function FecharRachaduras()
+    local rachaduras = EncontrarRachaduras()
+    if #rachaduras == 0 then return false end
+    
+    Settings.Modo = "RACHADURAS"
+    
+    for _, crack in pairs(rachaduras) do
+        if crack.Distance > 25 then
+            MoverSuave(crack.Position)
+            task.wait(Settings.TweenSpeed + 0.2)
+        end
+        ExecutarComboSkills()
+        task.wait(0.2)
+    end
+    
+    return true
+end
+
+-- ============================================
+-- CONTROLAR GOLEMS (BRING PARA ZONA SEGURA)
+-- ============================================
+
+local function ControlarGolems()
+    local golems = EncontrarGolems()
+    if #golems == 0 then return false end
+    
+    Settings.Modo = "COMBATE"
+    
+    for _, golem in pairs(golems) do
+        if golem.Distance < 50 then
+            -- Teleporta o Golem para a SafeZone (funciona em NPCs)
+            pcall(function()
+                if Settings.SafeZone then
+                    golem.Root.CFrame = CFrame.new(Settings.SafeZone)
+                end
+            end)
+            task.wait(0.05)
+        end
+    end
+    
+    return true
+end
+
+-- ============================================
+-- COMPRAR BARCO
+-- ============================================
+
+local function ComprarBarco(nome)
+    local remotes = {
+        ReplicatedStorage:FindFirstChild("Remotes", true),
+        ReplicatedStorage:FindFirstChild("BoatRemote", true)
+    }
+    
+    for _, remote in pairs(remotes) do
+        if remote then
+            pcall(function()
+                remote:FireServer("Buy", nome)
+            end)
+        end
+    end
+    print("🚤 Barco solicitado: " .. nome)
+end
+
+-- ============================================
+-- NAVEGAÇÃO (PROCURAR ILHA)
+-- ============================================
+
+local Navegando = false
+local LoopNavegacao = nil
+local Angulo = 0
+
+local function MoverProcura()
+    local root = GetRoot()
+    if not root then return end
+    
+    Angulo = Angulo + (0.03 * (2 / Settings.SearchSpeed))
+    local raio = math.min(80, Settings.BoatSpeed / 2)
+    local dx = math.cos(Angulo) * raio
+    local dz = math.sin(Angulo) * raio
+    
+    local destino = root.Position + Vector3.new(dx, 0, dz)
+    
+    local ray = Workspace:Raycast(destino + Vector3.new(0, 50, 0), Vector3.new(0, -100, 0))
+    if ray then
+        destino = Vector3.new(destino.X, ray.Position.Y + 3, destino.Z)
+    end
+    
+    MoverSuave(destino)
+end
+
+local function IniciarBusca()
+    if Navegando then return end
+    Navegando = true
+    Settings.Ativo = true
+    Settings.Modo = "PROCURAR"
+    
+    IniciarAtaquePassivo()
+    ComprarBarco(Settings.BarcoSelecionado)
+    
+    print("========================================")
+    print("🦖 XANDOWN - PREHISTORIC ISLAND")
+    print("⚡ Hit Speed: " .. Settings.HitSpeed .. "/s")
+    print("🌀 Tween Speed: " .. Settings.TweenSpeed .. "s")
+    print("🚤 Boat Speed: " .. Settings.BoatSpeed)
+    print("🔍 Search Speed: " .. Settings.SearchSpeed .. "s")
+    print("========================================")
+    
+    LoopNavegacao = RunService.Heartbeat:Connect(function()
+        if not Settings.Ativo then
+            if LoopNavegacao then LoopNavegacao:Disconnect() end
+            Navegando = false
+            return
+        end
+        
+        local island, pos = EncontrarIlha()
+        if island and pos then
+            print("🏝️ ILHA ENCONTRADA! INDO PARA RELÍQUIA...")
+            MoverSuave(pos)
+            task.wait(Settings.TweenSpeed + 1)
+            
+            -- Loop do evento (prioridades)
+            spawn(function()
+                while Settings.Ativo do
+                    -- PRIORIDADE 1: Rachaduras (usa skills)
+                    if FecharRachaduras() then
+                        task.wait(0.5)
+                        goto continuar
+                    end
+                    
+                    -- PRIORIDADE 2: Golems (aplica bring)
+                    ControlarGolems()
+                    
+                    ::continuar::
+                    task.wait(0.2)
+                end
+            end)
+            return
+        end
+        
+        MoverProcura()
+        task.wait(Settings.SearchSpeed)
+    end)
+end
+
+local function PararBusca()
+    Settings.Ativo = false
+    Navegando = false
+    PararAtaquePassivo()
+    if LoopNavegacao then
+        LoopNavegacao:Disconnect()
+        LoopNavegacao = nil
+    end
+    print("⏹️ BUSCA PARADA")
+end
+
+-- ============================================
+-- GUI COMPLETA COM SLIDERS
+-- ============================================
+
+local function CriarGUI()
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "XandownPrehistoric"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = Player:WaitForChild("PlayerGui")
+    
+    -- Bolinha Flutuante (Arrastável)
+    local floatingBtn = Instance.new("ImageButton")
+    floatingBtn.Size = UDim2.new(0, 55, 0, 55)
+    floatingBtn.Position = UDim2.new(0, 15, 0.85, 0)
+    floatingBtn.BackgroundColor3 = Color3.fromRGB(255, 80, 40)
+    floatingBtn.BackgroundTransparency = 0
+    floatingBtn.BorderSizePixel = 0
+    floatingBtn.Parent = screenGui
+    
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(1, 0)
+    btnCorner.Parent = floatingBtn
+    
+    local icon = Instance.new("TextLabel")
+    icon.Size = UDim2.new(1, 0, 1, 0)
+    icon.BackgroundTransparency = 1
+    icon.Text = "🦖"
+    icon.TextColor3 = Color3.fromRGB(255, 255, 255)
+    icon.TextSize = 26
+    icon.Font = Enum.Font.GothamBold
+    icon.Parent = floatingBtn
+    
+    -- Menu Principal
+    local menuFrame = Instance.new("Frame")
+    menuFrame.Size = UDim2.new(0, 300, 0, 420)
+    menuFrame.Position = UDim2.new(0, 75, 0.6, 0)
+    menuFrame.BackgroundColor3 = Color3.fromRGB(12, 12, 24)
+    menuFrame.BackgroundTransparency = 0.08
+    menuFrame.BorderSizePixel = 0
+    menuFrame.Visible = true
+    menuFrame.ClipsDescendants = true
+    menuFrame.Parent = screenGui
+    
+    local menuCorner = Instance.new("UICorner")
+    menuCorner.CornerRadius = UDim.new(0, 12)
+    menuCorner.Parent = menuFrame
+    
+    local menuStroke = Instance.new("UIStroke")
+    menuStroke.Color = Color3.fromRGB(255, 80, 40)
+    menuStroke.Thickness = 1.5
+    menuStroke.Parent = menuFrame
+    
+    -- Header (arrastável)
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1, 0, 0, 45)
+    header.BackgroundColor3 = Color3.fromRGB(255, 80, 40)
+    header.BackgroundTransparency = 0.2
+    header.BorderSizePixel = 0
+    header.Parent = menuFrame
+    
+    local headerCorner = Instance.new("UICorner")
+    headerCorner.CornerRadius = UDim.new(0, 12)
+    headerCorner.Parent = header
+    
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -70, 1, 0)
+    title.Position = UDim2.new(0, 12, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "🦖 XANDOWN PREHISTORIC"
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.TextSize = 12
+    title.Font = Enum.Font.GothamBold
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = header
+    
+    -- Botão minimizar
+    local minBtn = Instance.new("TextButton")
+    minBtn.Size = UDim2.new(0, 28, 0, 28)
+    minBtn.Position = UDim2.new(1, -65, 0, 8)
+    minBtn.BackgroundColor3 = Color3.fromRGB(100, 100, 120)
+    minBtn.BackgroundTransparency = 0.5
+    minBtn.Text = "−"
+    minBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    minBtn.TextSize = 16
+    minBtn.Font = Enum.Font.GothamBold
+    minBtn.BorderSizePixel = 0
+    minBtn.Parent = header
+    
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 28, 0, 28)
+    closeBtn.Position = UDim2.new(1, -32, 0, 8)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    closeBtn.BackgroundTransparency = 0.5
+    closeBtn.Text = "✕"
+    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeBtn.TextSize = 12
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.BorderSizePixel = 0
+    closeBtn.Parent = header
+    
+    -- Container rolável
+    local container = Instance.new("ScrollingFrame")
+    container.Size = UDim2.new(1, -20, 1, -60)
+    container.Position = UDim2.new(0, 10, 0, 55)
+    container.BackgroundTransparency = 1
+    container.CanvasSize = UDim2.new(0, 0, 0, 450)
+    container.ScrollBarThickness = 3
+    container.Parent = menuFrame
+    
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0, 10)
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Parent = container
+    
+    -- ========================================
+    -- STATUS
+    -- ========================================
+    
+    local statusFrame = Instance.new("Frame")
+    statusFrame.Size = UDim2.new(1, 0, 0, 55)
+    statusFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 38)
+    statusFrame.BackgroundTransparency = 0.3
+    statusFrame.BorderSizePixel = 0
+    statusFrame.Parent = container
+    
+    local statusCorner = Instance.new("UICorner")
+    statusCorner.CornerRadius = UDim.new(0, 8)
+    statusCorner.Parent = statusFrame
+    
+    local statusText = Instance.new("TextLabel")
+    statusText.Size = UDim2.new(1, -10, 1, 0)
+    statusText.Position = UDim2.new(0, 5, 0, 0)
+    statusText.BackgroundTransparency = 1
+    statusText.Text = "✅ PRONTO\n⚙️ Modo: PARADO"
+    statusText.TextColor3 = Color3.fromRGB(100, 255, 150)
+    statusText.TextSize = 11
+    statusText.Font = Enum.Font.Gotham
+    statusText.TextYAlignment = Enum.TextYAlignment.Center
+    statusText.Parent = statusFrame
+    
+    -- ========================================
+    -- SLIDER HIT SPEED (20 a 200)
+    -- ========================================
+    
+    local hitFrame = Instance.new("Frame")
+    hitFrame.Size = UDim2.new(1, 0, 0, 55)
+    hitFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 38)
+    hitFrame.BackgroundTransparency = 0.3
+    hitFrame.BorderSizePixel = 0
+    hitFrame.Parent = container
+    
+    local hitCorner = Instance.new("UICorner")
+    hitCorner.CornerRadius = UDim.new(0, 8)
+    hitCorner.Parent = hitFrame
+    
+    local hitLabel = Instance.new("TextLabel")
+    hitLabel.Size = UDim2.new(1, -10, 0, 20)
+    hitLabel.Position = UDim2.new(0, 5, 0, 5)
+    hitLabel.BackgroundTransparency = 1
+    hitLabel.Text = "⚔️ Hit Speed: " .. Settings.HitSpeed .. "/s"
+    hitLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+    hitLabel.TextSize = 11
+    hitLabel.Font = Enum.Font.GothamBold
+    hitLabel.TextXAlignment = Enum.TextXAlignment.Left
+    hitLabel.Parent = hitFrame
+    
+    local hitSliderBg = Instance.new("Frame")
+    hitSliderBg.Size = UDim2.new(1, -20, 0, 4)
+    hitSliderBg.Position = UDim2.new(0, 10, 0, 32)
+    hitSliderBg.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+    hitSliderBg.BorderSizePixel = 0
+    hitSliderBg.Parent = hitFrame
+    
+    local hitSliderFill = Instance.new("Frame")
+    hitSliderFill.Size = UDim2.new((Settings.HitSpeed - 20) / 180, 0, 1, 0)
+    hitSliderFill.BackgroundColor3 = Color3.fromRGB(255, 80, 40)
+    hitSliderFill.BorderSizePixel = 0
+    hitSliderFill.Parent = hitSliderBg
+    
+    local hitKnob = Instance.new("TextButton")
+    hitKnob.Size = UDim2.new(0, 12, 0, 12)
+    hitKnob.Position = UDim2.new((Settings.HitSpeed - 20) / 180, -6, 0.5, -6)
+    hitKnob.BackgroundColor3 = Color3.fromRGB(255, 80, 40)
+    hitKnob.Text = ""
+    hitKnob.BorderSizePixel = 0
+    hitKnob.Parent = hitSliderBg
+    
+    local knobCorner = Instance.new("UICorner")
+    knobCorner.CornerRadius = UDim.new(1, 6)
+    knobCorner.Parent = hitKnob
+    
+    -- ========================================
+    -- SLIDER TWEEN SPEED (0.1 a 1)
+    -- ========================================
+    
+    local tweenFrame = Instance.new("Frame")
+    tweenFrame.Size = UDim2.new(1, 0, 0, 55)
+    tweenFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 38)
+    tweenFrame.BackgroundTransparency = 0.3
+    tweenFrame.BorderSizePixel = 0
+    tweenFrame.Parent = container
+    
+    local tweenCorner = Instance.new("UICorner")
+    tweenCorner.CornerRadius = UDim.new(0, 8)
+    tweenCorner.Parent = tweenFrame
+    
+    local tweenLabel = Instance.new("TextLabel")
+    tweenLabel.Size = UDim2.new(1, -10, 0, 20)
+    tweenLabel.Position = UDim2.new(0, 5, 0, 5)
+    tweenLabel.BackgroundTransparency = 1
+    tweenLabel.Text = "🌀 Tween Speed: " .. string.format("%.1f", Settings.TweenSpeed) .. "s"
+    tweenLabel.TextColor3 = Color3.fromRGB(100, 200, 255)
+    tweenLabel.TextSize = 11
+    tweenLabel.Font = Enum.Font.GothamBold
+    tweenLabel.TextXAlignment = Enum.TextXAlignment.Left
+    tweenLabel.Parent = tweenFrame
+    
+    local tweenSliderBg = Instance.new("Frame")
+    tweenSliderBg.Size = UDim2.new(1, -20, 0, 4)
+    tweenSliderBg.Position = UDim2.new(0, 10, 0, 32)
+    tweenSliderBg.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+    tweenSliderBg.BorderSizePixel = 0
+    tweenSliderBg.Parent = tweenFrame
+    
+    local tweenSliderFill = Instance.new("Frame")
+    tweenSliderFill.Size = UDim2.new((Settings.TweenSpeed - 0.1) / 0.9, 0, 1, 0)
+    tweenSliderFill.BackgroundColor3 = Color3.fromRGB(80, 150, 255)
+    tweenSliderFill.BorderSizePixel = 0
+    tweenSliderFill.Parent = tweenSliderBg
+    
+    local tweenKnob = Instance.new("TextButton")
+    tweenKnob.Size = UDim2.new(0, 12, 0, 12)
+    tweenKnob.Position = UDim2.new((Settings.TweenSpeed - 0.1) / 0.9, -6, 0.5, -6)
+    tweenKnob.BackgroundColor3 = Color3.fromRGB(80, 150, 255)
+    tweenKnob.Text = ""
+    tweenKnob.BorderSizePixel = 0
+    tweenKnob.Parent = tweenSliderBg
+    
+    local tweenKnobCorner = Instance.new("UICorner")
+    tweenKnobCorner.CornerRadius = UDim.new(1, 6)
+    tweenKnobCorner.Parent = tweenKnob
+    
+    -- ========================================
+    -- SLIDER BOAT SPEED (50 a 300)
+    -- ========================================
+    
+    local boatFrame = Instance.new("Frame")
+    boatFrame.Size = UDim2.new(1, 0, 0, 55)
+    boatFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 38)
+    boatFrame.BackgroundTransparency = 0.3
+    boatFrame.BorderSizePixel = 0
+    boatFrame.Parent = container
+    
+    local boatCorner = Instance.new("UICorner")
+    boatCorner.CornerRadius = UDim.new(0, 8)
+    boatCorner.Parent = boatFrame
+    
+    local boatLabel = Instance.new("TextLabel")
+    boatLabel.Size = UDim2.new(1, -10, 0, 20)
+    boatLabel.Position = UDim2.new(0, 5, 0, 5)
+    boatLabel.BackgroundTransparency = 1
+    boatLabel.Text = "🚤 Boat Speed: " .. Settings.BoatSpeed
+    boatLabel.TextColor3 = Color3.fromRGB(100, 255, 150)
+    boatLabel.TextSize = 11
+    boatLabel.Font = Enum.Font.GothamBold
+    boatLabel.TextXAlignment = Enum.TextXAlignment.Left
+    boatLabel.Parent = boatFrame
+    
+    local boatSliderBg = Instance.new("Frame")
+    boatSliderBg.Size = UDim2.new(1, -20, 0, 4)
+    boatSliderBg.Position = UDim2.new(0, 10, 0, 32)
+    boatSliderBg.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+    boatSliderBg.BorderSizePixel = 0
+    boatSliderBg.Parent = boatFrame
+    
+    local boatSliderFill = Instance.new("Frame")
+    boatSliderFill.Size = UDim2.new((Settings.BoatSpeed - 50) / 250, 0, 1, 0)
+    boatSliderFill.BackgroundColor3 = Color3.fromRGB(100, 255, 150)
+    boatSliderFill.BorderSizePixel = 0
+    boatSliderFill.Parent = boatSliderBg
+    
+    local boatKnob = Instance.new("TextButton")
+    boatKnob.Size = UDim2.new(0, 12, 0, 12)
+    boatKnob.Position = UDim2.new((Settings.BoatSpeed - 50) / 250, -6, 0.5, -6)
+    boatKnob.BackgroundColor3 = Color3.fromRGB(100, 255, 150)
+    boatKnob.Text = ""
+    boatKnob.BorderSizePixel = 0
+    boatKnob.Parent = boatSliderBg
+    
+    local boatKnobCorner = Instance.new("UICorner")
+    boatKnobCorner.CornerRadius = UDim.new(1, 6)
+    boatKnobCorner.Parent = boatKnob
+    
+    -- ========================================
+    -- SLIDER SEARCH SPEED (0.5 a 5)
+    -- ========================================
+    
+    local searchFrame = Instance.new("Frame")
+    searchFrame.Size = UDim2.new(1, 0, 0, 55)
+    searchFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 38)
+    searchFrame.BackgroundTransparency = 0.3
+    searchFrame.BorderSizePixel = 0
+    searchFrame.Parent = container
+    
+    local searchCorner = Instance.new("UICorner")
+    searchCorner.CornerRadius = UDim.new(0, 8)
+    searchCorner.Parent = searchFrame
+    
+    local searchLabel = Instance.new("TextLabel")
+    searchLabel.Size = UDim2.new(1, -10, 0, 20)
+    searchLabel.Position = UDim2.new(0, 5, 0, 5)
+    searchLabel.BackgroundTransparency = 1
+    searchLabel.Text = "🔍 Search Speed: " .. string.format("%.1f", Settings.SearchSpeed) .. "s"
+    searchLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+    searchLabel.TextSize = 11
+    searchLabel.Font = Enum.Font.GothamBold
+    searchLabel.TextXAlignment = Enum.TextXAlignment.Left
+    searchLabel.Parent = searchFrame
+    
+    local searchSliderBg = Instance.new("Frame")
+    searchSliderBg.Size = UDim2.new(1, -20, 0, 4)
+    searchSliderBg.Position = UDim2.new(0, 10, 0, 32)
+    searchSliderBg.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+    searchSliderBg.BorderSizePixel = 0
+    searchSliderBg.Parent = searchFrame
+    
+    local searchSliderFill = Instance.new("Frame")
+    searchSliderFill.Size = UDim2.new((Settings.SearchSpeed - 0.5) / 4.5, 0, 1, 0)
+    searchSliderFill.BackgroundColor3 = Color3.fromRGB(255, 200, 100)
+    searchSliderFill.BorderSizePixel = 0
+    searchSliderFill.Parent = searchSliderBg
+    
+    local searchKnob = Instance.new("TextButton")
+    searchKnob.Size = UDim2.new(0, 12, 0, 12)
+    searchKnob.Position = UDim2.new((Settings.SearchSpeed - 0.5) / 4.5, -6, 0.5, -6)
+    searchKnob.BackgroundColor3 = Color3.fromRGB(255, 200, 100)
+    searchKnob.Text = ""
+    searchKnob.BorderSizePixel = 0
+    searchKnob.Parent = searchSliderBg
+    
+    local searchKnobCorner = Instance.new("UICorner")
+    searchKnobCorner.CornerRadius = UDim.new(1, 6)
+    searchKnobCorner.Parent = searchKnob
+    
+    -- ========================================
+    -- DROPDOWN BARCO
+    -- ========================================
+    
+    local boatSelectFrame = Instance.new("Frame")
+    boatSelectFrame.Size = UDim2.new(1, 0, 0, 55)
+    boatSelectFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 38)
+    boatSelectFrame.BackgroundTransparency = 0.3
+    boatSelectFrame.BorderSizePixel = 0
+    boatSelectFrame.Parent = container
+    
+    local boatSelectCorner = Instance.new("UICorner")
+    boatSelectCorner.CornerRadius = UDim.new(0, 8)
+    boatSelectCorner.Parent = boatSelectFrame
+    
+    local boatSelectLabel = Instance.new("TextLabel")
+    boatSelectLabel.Size = UDim2.new(0.5, -5, 1, 0)
+    boatSelectLabel.Position = UDim2.new(0, 5, 0, 0)
+    boatSelectLabel.BackgroundTransparency = 1
+    boatSelectLabel.Text = "🚤 Barco:"
+    boatSelectLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    boatSelectLabel.TextSize = 11
+    boatSelectLabel.Font = Enum.Font.GothamBold
+    boatSelectLabel.TextXAlignment = Enum.TextXAlignment.Left
+    boatSelectLabel.Parent = boatSelectFrame
+    
+    local boatDropdown = Instance.new("TextButton")
+    boatDropdown.Size = UDim2.new(0.45, 0, 0, 35)
+    boatDropdown.Position = UDim2.new(0.52, 0, 0.5, -17)
+    boatDropdown.BackgroundColor3 = Color3.fromRGB(255, 80, 40)
+    boatDropdown.Text = Settings.BarcoSelecionado
+    boatDropdown.TextColor3 = Color3.fromRGB(255, 255, 255)
+    boatDropdown.TextSize = 11
+    boatDropdown.Font = Enum.Font.GothamBold
+    boatDropdown.BorderSizePixel = 0
+    boatDropdown.Parent = boatSelectFrame
+    
+    local boatDropdownCorner = Instance.new("UICorner")
+    boatDropdownCorner.CornerRadius = UDim.new(0, 6)
+    boatDropdownCorner.Parent = boatDropdown
+    
+    local barcos = {"Dinghy", "Sloop", "Brigade", "Grand Brigade", "Miracle", "Sentinel"}
+    local boatMenu = Instance.new("Frame")
+    boatMenu.Size = UDim2.new(0, 130, 0, #barcos * 30)
+    boatMenu.Position = UDim2.new(0.52, 0, 1, 0)
+    boatMenu.BackgroundColor3 = Color3.fromRGB(25, 25, 42)
+    boatMenu.Visible = false
+    boatMenu.BorderSizePixel = 0
+    boatMenu.Parent = boatSelectFrame
+    
+    local boatMenuCorner = Instance.new("UICorner")
+    boatMenuCorner.CornerRadius = UDim.new(0, 6)
+    boatMenuCorner.Parent = boatMenu
+    
+    for i, boat in pairs(barcos) do
+        local opt = Instance.new("TextButton")
+        opt.Size = UDim2.new(1, 0, 0, 28)
+        opt.Position = UDim2.new(0, 0, 0, (i-1)*28)
+        opt.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+        opt.Text = boat
+        opt.TextColor3 = Color3.fromRGB(220, 220, 220)
+        opt.TextSize = 10
+        opt.Font = Enum.Font.Gotham
+        opt.BorderSizePixel = 0
+        opt.Parent = boatMenu
+        
+        opt.MouseButton1Click:Connect(function()
+            Settings.BarcoSelecionado = boat
+            boatDropdown.Text = boat
+            boatMenu.Visible = false
+        end)
+    end
+    
+    boatDropdown.MouseButton1Click:Connect(function()
+        boatMenu.Visible = not boatMenu.Visible
+    end)
+    
+    -- ========================================
+    -- BOTÕES INICIAR/PARAR
+    -- ========================================
+    
+    local startBtn = Instance.new("TextButton")
+    startBtn.Size = UDim2.new(1, 0, 0, 45)
+    startBtn.BackgroundColor3 = Color3.fromRGB(76, 175, 80)
+    startBtn.Text = "🚀 INICIAR CAÇA"
+    startBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    startBtn.TextSize = 13
+    startBtn.Font = Enum.Font.GothamBold
+    startBtn.BorderSizePixel = 0
+    startBtn.Parent = container
+    
+    local startCorner = Instance.new("UICorner")
+    startCorner.CornerRadius = UDim.new(0, 8)
+    startCorner.Parent = startBtn
+    
+    local stopBtn = Instance.new("TextButton")
+    stopBtn.Size = UDim2.new(1, 0, 0, 45)
+    stopBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    stopBtn.Text = "⏹️ PARAR CAÇA"
+    stopBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    stopBtn.TextSize = 13
+    stopBtn.Font = Enum.Font.GothamBold
+    stopBtn.BorderSizePixel = 0
+    stopBtn.Parent = container
+    
+    local stopCorner = Instance.new("UICorner")
+    stopCorner.CornerRadius = UDim.new(0, 8)
+    stopCorner.Parent = stopBtn
+    
+    -- ========================================
+    -- INFORMAÇÕES
+    -- ========================================
+    
+    local infoFrame = Instance.new("Frame")
+    infoFrame.Size = UDim2.new(1, 0, 0, 45)
+    infoFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 38)
+    infoFrame.BackgroundTransparency = 0.3
+    infoFrame.BorderSizePixel = 0
+    infoFrame.Parent = container
+    
+    local infoCorner = Instance.new("UICorner")
+    infoCorner.CornerRadius = UDim.new(0, 8)
+    infoCorner.Parent = infoFrame
+    
+    local playersLabel = Instance.new("TextLabel")
+    playersLabel.Size = UDim2.new(1, -10, 1, 0)
+    playersLabel.Position = UDim2.new(0, 5, 0, 0)
+    playersLabel.BackgroundTransparency = 1
+    playersLabel.Text = "👥 Players no servidor: " .. #Players:GetPlayers()
+    playersLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+    playersLabel.TextSize = 10
+    playersLabel.Font = Enum.Font.Gotham
+    playersLabel.Parent = infoFrame
+    
+    -- ========================================
+    -- FUNÇÕES DOS SLIDERS
+    -- ========================================
+    
+    local draggingHit = false
+    local draggingTween = false
+    local draggingBoat = false
+    local draggingSearch = false
+    
+    -- Hit Speed (20-200)
+    hitSliderBg.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            local pos = math.clamp((input.Position.X - hitSliderBg.AbsolutePosition.X) / hitSliderBg.AbsoluteSize.X, 0, 1)
+            local value = math.floor(20 + (pos * 180))
+            hitSliderFill.Size = UDim2.new(pos, 0, 1, 0)
+            hitKnob.Position = UDim2.new(pos, -6, 0.5, -6)
+            hitLabel.Text = "⚔️ Hit Speed: " .. value .. "/s"
+            Settings.HitSpeed = value
+            draggingHit = true
+        end
+    end)
+    
+    hitKnob.InputBegan:Connect(function() draggingHit = true end)
+    hitKnob.InputEnded:Connect(function() draggingHit = false end)
+    
+    -- Tween Speed (0.1-1)
+    tweenSliderBg.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            local pos = math.clamp((input.Position.X - tweenSliderBg.AbsolutePosition.X) / tweenSliderBg.AbsoluteSize.X, 0, 1)
+            local value = 0.1 + (pos * 0.9)
+            tweenSliderFill.Size = UDim2.new(pos, 0, 1, 0)
+            tweenKnob.Position = UDim2.new(pos, -6, 0.5, -6)
+            tweenLabel.Text = "🌀 Tween Speed: " .. string.format("%.1f", value) .. "s"
+            Settings.TweenSpeed = value
+            draggingTween = true
+        end
+    end)
+    
+    tweenKnob.InputBegan:Connect(function() draggingTween = true end)
+    tweenKnob.InputEnded:Connect(function() draggingTween = false end)
+    
+    -- Boat Speed (50-300)
+    boatSliderBg.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            local pos = math.clamp((input.Position.X - boatSliderBg.AbsolutePosition.X) / boatSliderBg.AbsoluteSize.X, 0, 1)
+            local value = math.floor(50 + (pos * 250))
+            boatSliderFill.Size = UDim2.new(pos, 0, 1, 0)
+            boatKnob.Position = UDim2.new(pos, -6, 0.5, -6)
+            boatLabel.Text = "🚤 Boat Speed: " .. value
+            Settings.BoatSpeed = value
+            draggingBoat = true
+        end
+    end)
+    
+    boatKnob.InputBegan:Connect(function() draggingBoat = true end)
+    boatKnob.InputEnded:Connect(function() draggingBoat = false end)
+    
+    -- Search Speed (0.5-5)
+    searchSliderBg.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            local pos = math.clamp((input.Position.X - searchSliderBg.AbsolutePosition.X) / searchSliderBg.AbsoluteSize.X, 0, 1)
+            local value = 0.5 + (pos * 4.5)
+            searchSliderFill.Size = UDim2.new(pos, 0, 1, 0)
+            searchKnob.Position = UDim2.new(pos, -6, 0.5, -6)
+            searchLabel.Text = "🔍 Search Speed: " .. string.format("%.1f", value) .. "s"
+            Settings.SearchSpeed = value
+            draggingSearch = true
+        end
+    end)
+    
+    searchKnob.InputBegan:Connect(function() draggingSearch = true end)
+    searchKnob.InputEnded:Connect(function() draggingSearch = false end)
+    
+    -- Movimento dos sliders
+    UserInputService.InputChanged:Connect(function(input)
+        if draggingHit and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local pos = math.clamp((input.Position.X - hitSliderBg.AbsolutePosition.X) / hitSliderBg.AbsoluteSize.X, 0, 1)
+            local value = math.floor(20 + (pos * 180))
+            hitSliderFill.Size = UDim2.new(pos, 0, 1, 0)
+            hitKnob.Position = UDim2.new(pos, -6, 0.5, -6)
+            hitLabel.Text = "⚔️ Hit Speed: " .. value .. "/s"
+            Settings.HitSpeed = value
+        end
+        
+        if draggingTween and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local pos = math.clamp((input.Position.X - tweenSliderBg.AbsolutePosition.X) / tweenSliderBg.AbsoluteSize.X, 0, 1)
+            local value = 0.1 + (pos * 0.9)
+            tweenSliderFill.Size = UDim2.new(pos, 0, 1, 0)
+            tweenKnob.Position = UDim2.new(pos, -6, 0.5, -6)
+            tweenLabel.Text = "🌀 Tween Speed: " .. string.format("%.1f", value) .. "s"
+            Settings.TweenSpeed = value
+        end
+        
+        if draggingBoat and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local pos = math.clamp((input.Position.X - boatSliderBg.AbsolutePosition.X) / boatSliderBg.AbsoluteSize.X, 0, 1)
+            local value = math.floor(50 + (pos * 250))
+            boatSliderFill.Size = UDim2.new(pos, 0, 1, 0)
+            boatKnob.Position = UDim2.new(pos, -6, 0.5, -6)
+            boatLabel.Text = "🚤 Boat Speed: " .. value
+            Settings.BoatSpeed = value
+        end
+        
+        if draggingSearch and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local pos = math.clamp((input.Position.X - searchSliderBg.AbsolutePosition.X) / searchSliderBg.AbsoluteSize.X, 0, 1)
+            local value = 0.5 + (pos * 4.5)
+            searchSliderFill.Size = UDim2.new(pos, 0, 1, 0)
+            searchKnob.Position = UDim2.new(pos, -6, 0.5, -6)
+            searchLabel.Text = "🔍 Search Speed: " .. string.format("%.1f", value) .. "s"
+            Settings.SearchSpeed = value
+        end
+    end)
+    
+    -- ========================================
+    -- AÇÕES DOS BOTÕES
+    -- ========================================
+    
+    startBtn.MouseButton1Click:Connect(function()
+        IniciarBusca()
+        statusText.Text = "🟢 ATIVO\n⚙️ Modo: " .. Settings.Modo
+        statusText.TextColor3 = Color3.fromRGB(255, 200, 100)
+        startBtn.BackgroundColor3 = Color3.fromRGB(100, 200, 100)
+        task.wait(0.5)
+        startBtn.BackgroundColor3 = Color3.fromRGB(76, 175, 80)
+    end)
+    
+    stopBtn.MouseButton1Click:Connect(function()
+        PararBusca()
+        statusText.Text = "✅ PRONTO\n⚙️ Modo: PARADO"
+        statusText.TextColor3 = Color3.fromRGB(100, 255, 150)
+    end)
+    
+    closeBtn.MouseButton1Click:Connect(function()
+        PararBusca()
+        screenGui:Destroy()
+    end)
+    
+    -- ========================================
+    -- MINIMIZAR MENU
+    -- ========================================
+    
+    local isMinimized = false
+    local alturaOriginal = 420
+    
+    minBtn.MouseButton1Click:Connect(function()
+        isMinimized = not isMinimized
+        if isMinimized then
+            menuFrame:TweenSize(UDim2.new(0, 300, 0, 45), "Out", "Quad", 0.2, true)
+            minBtn.Text = "+"
+            container.Visible = false
+        else
+            menuFrame:TweenSize(UDim2.new(0, 300, 0, alturaOriginal), "Out", "Quad", 0.2, true)
+            minBtn.Text = "−"
+            container.Visible = true
+        end
+    end)
+    
+    -- ========================================
+    -- ARRASTAR BOLINHA
+    -- ========================================
+    
+    local isDraggingBtn = false
+    local btnDragStart = nil
+    
+    floatingBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            isDraggingBtn = true
+            btnDragStart = input.Position
+        end
+    end)
+    
+    UserInputService.InputChanged:Connect(function(input)
+        if isDraggingBtn and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local delta = input.Position - btnDragStart
+            local newX = floatingBtn.Position.X.Offset + delta.X
+            local newY = floatingBtn.Position.Y.Offset + delta.Y
+            newX = math.clamp(newX, 0, 700)
+            newY = math.clamp(newY, 50, 550)
+            floatingBtn.Position = UDim2.new(0, newX, 0, newY)
+            btnDragStart = input.Position
+        end
+    end)
+    
+    floatingBtn.InputEnded:Connect(function()
+        isDraggingBtn = false
+    end)
+    
+    -- ========================================
+    -- ARRASTAR MENU
+    -- ========================================
+    
+    local isDraggingMenu = false
+    local menuDragStart = nil
+    local menuStartPos = nil
+    
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            isDraggingMenu = true
+            menuDragStart = input.Position
+            menuStartPos = menuFrame.Position
+        end
+    end)
+    
+    UserInputService.InputChanged:Connect(function(input)
+        if isDraggingMenu and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local delta = input.Position - menuDragStart
+            local newX = menuStartPos.X.Offset + delta.X
+            local newY = menuStartPos.Y.Offset + delta.Y
+            newX = math.clamp(newX, -400, 800)
+            newY = math.clamp(newY, 50, 550)
+            menuFrame.Position = UDim2.new(0, newX, 0, newY)
+        end
+    end)
+    
+    header.InputEnded:Connect(function()
+        isDraggingMenu = false
+    end)
+    
+    -- ========================================
+    -- BOLINHA ABRE/FECHA MENU
+    -- ========================================
+    
+    local lastClick = 0
+    floatingBtn.MouseButton1Click:Connect(function()
+        if not isDraggingBtn and tick() - lastClick > 0.2 then
+            menuFrame.Visible = not menuFrame.Visible
+            lastClick = tick()
+        end
+    end)
+    
+    -- ========================================
+    -- ATUALIZAR INFO
+    -- ========================================
+    
+    spawn(function()
+        while screenGui.Parent do
+            playersLabel.Text = "👥 Players no servidor: " .. #Players:GetPlayers()
+            if Settings.Ativo then
+                statusText.Text = "🟢 ATIVO\n⚙️ Modo: " .. Settings.Modo
+            end
+            task.wait(3)
+        end
+    end)
+    
+    print("========================================")
+    print("🦖 XANDOWN PREHISTORIC ISLAND")
+    print("✅ Script carregado com sucesso!")
+    print("📌 Ajuste todas as velocidades pela GUI")
+    print("📌 Hit Speed: 20 a 200 hits/segundo")
+    print("========================================")
+end
+
+-- ============================================
+-- INICIAR
+-- ============================================
+
+CriarGUI()
